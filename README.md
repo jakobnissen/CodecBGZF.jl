@@ -1,7 +1,7 @@
 # CodecBGZF.jl
 
-![CI](https://github.com/jakobnissen/StackCollections.jl/workflows/CI/badge.svg)
-[![Codecov](https://codecov.io/gh/jakobnissen/StackCollections.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/jakobnissen/StackCollections.jl)
+![CI](https://github.com/jakobnissen/CodecBGZF.jl/workflows/CI/badge.svg)
+[![codecov](https://codecov.io/gh/jakobnissen/CodecBGZF.jl/branch/master/graph/badge.svg?token=VKFC19YZUG)](https://codecov.io/gh/jakobnissen/CodecBGZF.jl)
 
 _Codec for BGZF files_
 

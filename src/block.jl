@@ -55,7 +55,7 @@ nfull(::Type{Block{Compressor}}) = SAFE_BLOCK_SIZE
 Base.wait(b::Block) = wait(b.task)
 
 function check_eof_block(block::Block{Decompressor})
-    if !iszero(block.inlen)
+    if !iszero(block.outlen)
         bgzferror("No EOF block. Truncated file?")
     end
 end
@@ -118,7 +118,7 @@ function index!(data::Vector{UInt8}, len::Integer)
         si1 = data[pos]
         si2 = data[pos+1]
         slen = UInt16(data[pos+2]) | UInt16(data[pos+3]) << 8
-        if si1 == 0x42 || si2 == 0x43
+        if (si1 == 0x42) & (si2 == 0x43)
             if slen != 2
                 bgzferror("invalid subfield length")
             end
@@ -128,9 +128,7 @@ function index!(data::Vector{UInt8}, len::Integer)
         # skip this field
         pos += 4 + slen
     end
-    if bsize == 0
-        bgzferror("no block size")
-    end
+    iszero(bsize) && bgzferror("no block size")
 
     # +=======================+---+---+---+---+---+---+---+---+
     # |...compressed blocks...|     CRC32     |     ISIZE     |
@@ -163,8 +161,6 @@ function _queue!(block::Block{Compressor})
     # Tail: CRC + isize
 	bitstore(block.crc32, block.outdata, 18 + compress_len + 1)
 	bitstore(block.inlen % UInt32, block.outdata, 18 + compress_len + 5)
-	
-    block.inlen = 0
 end
 
 function _queue!(block::Block{Decompressor})
@@ -174,5 +170,4 @@ function _queue!(block::Block{Decompressor})
 
     crc32 = unsafe_crc32(pointer(block.outdata), block.outlen)
     crc32 != block.crc32 && bgzferror("CRC32 checksum does not match")
-	block.inlen = 0
 end

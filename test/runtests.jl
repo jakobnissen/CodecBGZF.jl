@@ -26,6 +26,10 @@ Base.seek(b::Buffer, v::Integer) = seek(b.x, v)
     @test voff <= VirtualOffset(0, 1)
     @test voff != VirtualOffset(1, 0)
     @test voff <= VirtualOffset(1, 0)
+    @test convert(UInt64, VirtualOffset(0, 1)) == UInt(1)
+    @test convert(UInt64, VirtualOffset(1, 0)) == UInt(1 << 16)
+    @test convert(VirtualOffset, UInt64(0x10001)) == VirtualOffset(1, 1)
+    @test isless(voff, VirtualOffset(1, 0))
     @test voff[1] == 0
     @test voff[2] == 0
     @test string(voff) == "VirtualOffset(0, 0)"
@@ -57,17 +61,44 @@ end
 	stream = BGZFCompressorStream(IOBuffer("foo"))
 	@test stream isa BGZFCompressorStream
 
-    stream = BGZFDecompressorStream(IOBuffer([0x1a]))
+    # Bad gzip identifier
+    stream = BGZFDecompressorStream(IOBuffer([0x1a, 0x1a]))
 	@test_throws BGZFError read(stream, UInt8)
 
+    # Too short
     stream = BGZFDecompressorStream(IOBuffer([0x1f, 0x8b]))
 	@test_throws BGZFError read(stream, UInt8)
 
+    # Bad compression flag
     stream = BGZFDecompressorStream(IOBuffer([0x1f, 0x8b, 0x00, 0x04]))
 	@test_throws BGZFError read(stream, UInt8)
 
+    # Too short
     stream = BGZFDecompressorStream(IOBuffer([0x1f, 0x8b, 0x08, 0x04]))
 	@test_throws BGZFError read(stream, UInt8)
+
+    # Bad flag
+    stream = BGZFDecompressorStream(IOBuffer([0x1f, 0x8b, 0x08, 0xfa]))
+	@test_throws BGZFError read(stream, UInt8)
+
+	bad_subfield = UInt8[0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+	                     0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x03, 0x00,
+	                     0x23, 0x00, 0x01, 0x05, 0x00, 0xfa, 0xff, 0x68,
+	                     0x65, 0x6c, 0x6c, 0x6f, 0x86, 0xa6, 0x10, 0x36,
+	                     0x05, 0x00, 0x00, 0x00]
+
+    stream = BGZFDecompressorStream(IOBuffer(bad_subfield))
+	@test_throws BGZFError read(stream, UInt8)
+
+    no_bsize     = UInt8[0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+	                     0x00, 0xff, 0x06, 0x00, 0x41, 0x43, 0x02, 0x00,
+	                     0x23, 0x00, 0x01, 0x05, 0x00, 0xfa, 0xff, 0x68,
+	                     0x65, 0x6c, 0x6c, 0x6f, 0x86, 0xa6, 0x10, 0x36,
+	                     0x05, 0x00, 0x00, 0x00]
+
+    stream = BGZFDecompressorStream(IOBuffer(no_bsize))
+	@test_throws BGZFError read(stream, UInt8)
+
 
 	bad_crc = copy(CodecBGZF.EOF_BLOCK)
 	bad_crc[end-6] = 0x01
@@ -114,6 +145,16 @@ end
 	write(stream, "")
 	close(stream)
 	@test take!(buffer) == CodecBGZF.EOF_BLOCK
+
+	# No EOF file
+	buffer = Buffer()
+	stream = BGZFCompressorStream(buffer)
+	write(stream, "hello")
+	close(stream)
+	data = take!(buffer)
+	noend = data[1:end-28]
+	stream = BGZFDecompressorStream(Buffer(noend))
+	@test_throws BGZFError read(stream)
 end
 
 @testset "Larger files" begin
@@ -156,6 +197,16 @@ end
 end
 	
 @testset "BGZF offsets" begin
+    function test_virtualoffset(stream, data)
+        v = VirtualOffset(stream)
+        next = read(stream, 128)
+        coff, uoff = offsets(v)
+        @test data[coff+1:coff+2] == [0x1f, 0x8b]
+        seekstart(stream)
+        seek(stream, v)
+        @test read(stream, 128) == next
+    end
+    
     A = collect(reinterpret(UInt8, rand(1:2000, 100000)))
     buffer = Buffer()
     stream = BGZFCompressorStream(buffer)
@@ -165,14 +216,26 @@ end
 
     stream = BGZFDecompressorStream(Buffer(compressed))
     read(stream, 25000)
-    v = VirtualOffset(stream)
-    next = read(stream, 128)
-    coff, uoff = offsets(v)
-    @test compressed[coff+1:coff+2] == [0x1f, 0x8b]
+    test_virtualoffset(stream, compressed)
 
+    # Larger offset
     seekstart(stream)
-    seek(stream, v)
-    @test read(stream, 128) == next
+    read(stream, 125000)
+    test_virtualoffset(stream, compressed)
+    close(stream)
+
+    # Go back multiple blocks for offset, and also parse lots of empty blocks
+    buffer = Buffer()
+    for i in 1:20
+        stream = BGZFCompressorStream(buffer)
+        write(stream, rand(UInt8, 50))
+        close(stream)
+    end
+    data = take!(buffer)
+    buffer = Buffer(data)
+    stream = BGZFDecompressorStream(buffer)
+    read(stream, 10)
+    test_virtualoffset(stream, data)
 end
 
 @testset "gzi" begin

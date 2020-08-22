@@ -77,16 +77,16 @@ remaining(codec::BGZFCodec{T}) where T = nfull(Block{T}) - codec.bufferlen
 
 """Switches the code to the next block to process, given whether the input stream is eof.
 Returns block index, or nothing if there are no more blocks to process"""
-function increment_block!(codec::BGZFCodec, eof::Bool)
+function increment_block!(codec::BGZFCodec, nodata::Bool)
 	# Next block index
 	i = ifelse(codec.index == nblocks(codec), 1, codec.index + 1)
 	
 	# We need to wait for the blocks to make sure they're actually empty
 	wait(codec.blocks[i])
 
-	# If we're at EOF, we don't need to load any data into the blocks, so we
+	# If we have no data, we don't need to load any data into the blocks, so we
 	# just skip to the next block with data.
-	if eof
+	if nodata
 		while isempty(codec.blocks[i])
 
 			# If we have checked all blocks, we have nothing more to do. Just check
@@ -216,47 +216,49 @@ function copy_from_outbuffer(codec::BGZFCodec, output::Memory, consumed::Integer
     return (Int(consumed), n, :ok)
 end
 
+# Note: This function MUST make progress in either input or output, else
+# transcoding streams will keep resizing the buffers thinking the small buffer
+# size blocks the codec.
 function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::Memory, error::Error) where T
 	consumed = 0
-    block = get_block(codec)
     eof = iszero(length(input))
+    
+    # We must continue looping through the blocks until we have either consumed
+    # or produced data
+    while true
+        block = get_block(codec)
+	    # If we have spare data in the current block, just give that
+        isempty(block) || return copy_from_outbuffer(codec, output, consumed)
 
-	# If we have spare data in the current block, just give that
-    isempty(block) || return copy_from_outbuffer(codec, output, consumed)
+    	# If there is data to be read in, we do that.
+    	if (length(input) - consumed) > 0
+    	    nb = min(remaining(codec), length(input) - consumed)
+        	outptr = pointer(codec.buffer, codec.bufferlen + 1)
+        	inptr = input.ptr + consumed
+        	unsafe_copyto!(outptr, inptr, nb)
+        	consumed += nb
+        	codec.bufferlen += nb
 
-	# If there is data to be read in, we do that.
-	if !eof
-    	consumed = min(remaining(codec), length(input))
-    	unsafe_copyto!(pointer(codec.buffer, codec.bufferlen + 1), input.ptr, consumed)
-    	codec.bufferlen += consumed
+    		# If we have read in data, but still not enough to queue a block, return no data
+    		# and wait for more data to be passed
+    		wait = iszero(consumed) & (codec.bufferlen < nfull(Block{T})) 
+        	wait && return (consumed, 0, :ok)
+        end
 
-		# If we have read in data, but still not enough to queue a block, return no data
-		# and wait for more data to be passed
-    	codec.bufferlen < nfull(Block{T}) && return (consumed, 0, :ok)
+        # At this point, if there is any data in the buffer, it must be enough
+        # to queue a whole block (since the buffer is either full, or input is EOF)
+        if !iszero(codec.bufferlen)
+        	used_buffer = load_block!(codec, block)
+        	queue!(block)
+        end
+
+        nodata = eof & iszero(codec.bufferlen)
+    	blockindex = increment_block!(codec, nodata)
+
+    	# This happens if there is no block to go to to either load new data or return
+    	# existing data. Then we are done.
+    	blockindex === nothing && return (0, 0, :end)
     end
-
-    # At this point, if there is any data in the buffer, it must be enough
-    # to queue a whole block (since the buffer is either full, or input is EOF)
-    if !iszero(codec.bufferlen)
-    	used_buffer = load_block!(codec, block)
-    	queue!(block)
-    end
-
-	blockindex = increment_block!(codec, eof)
-
-	# This happens if there is no block to go to to either load new data or return
-	# existing data. Then we are done.
-	blockindex === nothing && return (0, 0, :end)
-
-	# If next block is empty, it's because we need to load data into it, so we just
-	# return here and wait for process to be called again so the new block can be
-	# filled
-	if isempty(get_block(codec))
-		return (consumed, 0, :ok)
-	end
-	
-	# Else, the new block has data and we may as well just return that immediately.
-	return copy_from_outbuffer(codec, output, consumed)
 end
 
 # Read exactly N bytes to i'th index of data, except if stream is EOF
