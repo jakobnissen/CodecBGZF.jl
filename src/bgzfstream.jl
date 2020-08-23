@@ -28,8 +28,8 @@ end
 
 const CompressorCodec{O} = BGZFCodec{Compressor, O}
 const DecompressorCodec{O} = BGZFCodec{Decompressor, O}
-const BGZFCompressorStream = TranscodingStream{<:CompressorCodec}
-const BGZFDecompressorStream = TranscodingStream{<:DecompressorCodec}
+const BGZFCompressorStream = TranscodingStream{CompressorCodec{O}, O} where O
+const BGZFDecompressorStream = TranscodingStream{DecompressorCodec{O}, O} where O
 
 """
 	BGZFCompressorStream(io::IO; threads=nthreads(), compresslevel=6)
