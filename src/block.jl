@@ -21,33 +21,33 @@ const MAX_BLOCK_SIZE = UInt(64 * 1024)
 const SAFE_BLOCK_SIZE = UInt(MAX_BLOCK_SIZE - 256)
 
 mutable struct Block{T}
-	de_compressor::T
-	outdata::Vector{UInt8}
-	indata::Vector{UInt8}
-	task::Task
-	outlen::Int
-	outpos::Int
-	inlen::Int
-	offset::Int
-	blocklen::Int
-	crc32::UInt32
+    de_compressor::T
+    outdata::Vector{UInt8}
+    indata::Vector{UInt8}
+    task::Task
+    outlen::Int
+    outpos::Int
+    inlen::Int
+    offset::Int
+    blocklen::Int
+    crc32::UInt32
 end
 
 function Block(dc::T) where T <: DE_COMPRESSOR
-	outdata = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
-	indata = similar(outdata)
+    outdata = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
+    indata = similar(outdata)
 
-	# We initialize with a trivial, but completable task for sake of simplicity
-	task = schedule(Task(() -> nothing))
-	return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, 0, UInt32(0))
+    # We initialize with a trivial, but completable task for sake of simplicity
+    task = schedule(Task(() -> nothing))
+    return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, 0, UInt32(0))
 end
 
 isempty(block::Block) = block.outpos > block.outlen
 
 function Base.empty!(block::Block)
-	block.outlen = 0
-	block.outpos = 1
-	block.inlen = 0
+    block.outlen = 0
+    block.outpos = 1
+    block.inlen = 0
 end
 
 nfull(::Type{Block{Decompressor}}) = MAX_BLOCK_SIZE
@@ -65,11 +65,11 @@ function may mutate the codec, and is therefore not threadsafe."""
 function load_block! end
 
 function load_block!(codec, block::Block{Compressor})
-	copyto!(block.indata, 1, codec.buffer, 1, codec.bufferlen)
-	block.inlen = codec.bufferlen
-	block.outpos = 1
-	block.offset = get_new_offset(codec)
-	codec.bufferlen = 0
+    copyto!(block.indata, 1, codec.buffer, 1, codec.bufferlen)
+    block.inlen = codec.bufferlen
+    block.outpos = 1
+    block.offset = get_new_offset(codec)
+    codec.bufferlen = 0
 end
 
 function load_block!(codec, block::Block{Decompressor})
@@ -77,10 +77,10 @@ function load_block!(codec, block::Block{Decompressor})
 
     block.outpos = 1
     block.blocklen = blocksize
-	block.crc32 = crc32 % UInt32
+    block.crc32 = crc32 % UInt32
     block.outlen = isize
     block.inlen = blocksize - compress_pos - 7
-	block.offset = get_new_offset(codec)
+    block.offset = get_new_offset(codec)
 
     # Move data to block
     copyto!(block.indata, 1, codec.buffer, compress_pos, block.inlen)
@@ -135,7 +135,7 @@ function index!(data::Vector{UInt8}, len::Integer)
     # +=======================+---+---+---+---+---+---+---+---+
     blocksize = bsize + 1
     len < blocksize && bgzferror("Too small input")
-	crc32 = bitload(UInt32, data, blocksize - 7) % Int
+    crc32 = bitload(UInt32, data, blocksize - 7) % Int
     isize = bitload(UInt32, data, blocksize - 3) % Int
     compress_pos = xlen + 13
     
@@ -146,8 +146,8 @@ end
 queue!(block::Block) = block.task = @spawn _queue!(block)
 
 function _queue!(block::Block{Compressor})
-	# Meat: The compressed data
-	compress_len = unsafe_compress!(block.de_compressor,
+    # Meat: The compressed data
+    compress_len = unsafe_compress!(block.de_compressor,
                    pointer(block.outdata, 19), MAX_BLOCK_SIZE - 26,
                    pointer(block.indata), block.inlen)
     block.crc32 = unsafe_crc32(pointer(block.indata), block.inlen)
@@ -156,11 +156,11 @@ function _queue!(block::Block{Compressor})
 
     # Header: 18 bytes of header
     unsafe_copyto!(block.outdata, 1, BLOCK_HEADER, 1, 16)
-	bitstore(UInt16(block.outlen - 1), block.outdata, 17)
+    bitstore(UInt16(block.outlen - 1), block.outdata, 17)
 
     # Tail: CRC + isize
-	bitstore(block.crc32, block.outdata, 18 + compress_len + 1)
-	bitstore(block.inlen % UInt32, block.outdata, 18 + compress_len + 5)
+    bitstore(block.crc32, block.outdata, 18 + compress_len + 1)
+    bitstore(block.inlen % UInt32, block.outdata, 18 + compress_len + 5)
 end
 
 function _queue!(block::Block{Decompressor})

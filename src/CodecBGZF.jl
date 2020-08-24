@@ -22,7 +22,7 @@ import Base.Threads.@spawn
 const DE_COMPRESSOR = Union{Compressor, Decompressor}
 
 """
-	BGZFError(message::String)
+    BGZFError(message::String)
 
 BGZF de/compressor errored with `message` when processing data."
 """
@@ -31,13 +31,13 @@ struct BGZFError <: Exception
 end
 
 function bitload(T::Type{<:Base.BitInteger}, data::Vector{UInt8}, p::Integer)
-	ltoh(unsafe_load(Ptr{T}(pointer(data, p))))
+    ltoh(unsafe_load(Ptr{T}(pointer(data, p))))
 end
 
 function bitstore(v::Base.BitInteger, data::Vector{UInt8}, p::Integer)
-	unsafe_store!(Ptr{typeof(v)}(pointer(data, p)), htol(v))
+    unsafe_store!(Ptr{typeof(v)}(pointer(data, p)), htol(v))
 end
-	
+    
 @noinline bgzferror(s::String) = throw(BGZFError(s))
 
 include("virtualoffset.jl")
