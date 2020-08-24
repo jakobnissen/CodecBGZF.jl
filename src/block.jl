@@ -28,7 +28,8 @@ mutable struct Block{T}
     outlen::Int
     outpos::Int
     inlen::Int
-    offset::Int
+    offset::Int # offset in input stream
+    index::Int
     blocklen::Int
     crc32::UInt32
 end
@@ -39,7 +40,7 @@ function Block(dc::T) where T <: DE_COMPRESSOR
 
     # We initialize with a trivial, but completable task for sake of simplicity
     task = schedule(Task(() -> nothing))
-    return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, 0, UInt32(0))
+    return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, 0, 0, UInt32(0))
 end
 
 isempty(block::Block) = block.outpos > block.outlen
@@ -48,6 +49,7 @@ function Base.empty!(block::Block)
     block.outlen = 0
     block.outpos = 1
     block.inlen = 0
+    block.index = 1
 end
 
 nfull(::Type{Block{Decompressor}}) = MAX_BLOCK_SIZE
@@ -69,6 +71,7 @@ function load_block!(codec, block::Block{Compressor})
     block.inlen = codec.bufferlen
     block.outpos = 1
     block.offset = get_new_offset(codec)
+    block.index = last_block(codec).index + 1
     codec.bufferlen = 0
 end
 
@@ -81,6 +84,7 @@ function load_block!(codec, block::Block{Decompressor})
     block.outlen = isize
     block.inlen = blocksize - compress_pos - 7
     block.offset = get_new_offset(codec)
+    block.index = last_block(codec).index + 1
 
     # Move data to block
     copyto!(block.indata, 1, codec.buffer, compress_pos, block.inlen)

@@ -26,10 +26,10 @@ mutable struct BGZFCodec{T <: DE_COMPRESSOR, O <: IO} <: TranscodingStreams.Code
     bufferlen::Int
 end
 
-const CompressorCodec{O} = BGZFCodec{Compressor, O}
-const DecompressorCodec{O} = BGZFCodec{Decompressor, O}
-const BGZFCompressorStream = TranscodingStream{CompressorCodec{O}, O} where O
-const BGZFDecompressorStream = TranscodingStream{DecompressorCodec{O}, O} where O
+const CompressorCodec{O} = BGZFCodec{Compressor, O} where {O <: IO}
+const DecompressorCodec{O} = BGZFCodec{Decompressor, O} where {O <: IO}
+const BGZFCompressorStream = TranscodingStream{CompressorCodec{O}, O} where {O <: IO}
+const BGZFDecompressorStream = TranscodingStream{DecompressorCodec{O}, O} where {O <: IO}
 
 """
     BGZFCompressorStream(io::IO; threads=nthreads(), compresslevel=6)
@@ -71,6 +71,7 @@ end
 
 nblocks(c::BGZFCodec) = length(c.blocks)
 get_block(c::BGZFCodec) = @inbounds c.blocks[c.index]
+last_block(c::BGZFCodec) = @inbounds c.blocks[ifelse(c.index == 1, nblocks(c), c.index-1)]
 
 "Get number of remaning bytes in the codec's buffer before a new block can be indexed"
 remaining(codec::BGZFCodec{T}) where T = nfull(Block{T}) - codec.bufferlen
@@ -78,31 +79,22 @@ remaining(codec::BGZFCodec{T}) where T = nfull(Block{T}) - codec.bufferlen
 """Switches the code to the next block to process, given whether the input stream is eof.
 Returns block index, or nothing if there are no more blocks to process"""
 function increment_block!(codec::BGZFCodec, nodata::Bool)
-    # Next block index
-    i = ifelse(codec.index == nblocks(codec), 1, codec.index + 1)
+    block = get_block(codec)
+    nextindex = ifelse(codec.index == nblocks(codec), 1, codec.index + 1)
+    nextblock = @inbounds codec.blocks[nextindex]
     
-    # We need to wait for the blocks to make sure they're actually empty
-    wait(codec.blocks[i])
+    wait(nextblock)
 
-    # If we have no data, we don't need to load any data into the blocks, so we
-    # just skip to the next block with data.
-    if nodata
-        while isempty(codec.blocks[i])
-
-            # If we have checked all blocks, we have nothing more to do. Just check
-            # for EOF block, and return nothing
-            if i == codec.index
-                codec isa DecompressorCodec && check_eof_block(get_block(codec))
-                return nothing
-            end
-            i = ifelse(i == nblocks(codec), 1, i + 1)
-            wait(codec.blocks[i])
-        end
+    # We're at the last block if we havn't loaded new data into the current block
+    # and the next block has a lower index
+    if nodata & (block.index ≥ nextblock.index)
+        codec isa DecompressorCodec && check_eof_block(block)
+        return nothing
     end
-    codec.index = i
 
     push_offsets!(codec)
-    return i
+    codec.index = nextindex
+    return nextindex
 end
 
 "Add the current block's offsets and lengths to the codex offset vector"
@@ -113,10 +105,15 @@ function push_offsets!(codec)
 end
 
 "Get the offset for the soon-to-be indexed block based on the previous block"
-function get_new_offset(codec)
-    i = ifelse(codec.index == 1, nblocks(codec), codec.index - 1)
-    lastblock = @inbounds codec.blocks[i]
+function get_new_offset(codec::DecompressorCodec)
+    lastblock = last_block(codec)
     return lastblock.offset + lastblock.blocklen
+end
+
+"Get the offset for the soon-to-be indexed block based on the previous block"
+function get_new_offset(codec::CompressorCodec)
+    lastblock = last_block(codec)
+    return lastblock.offset + lastblock.inlen
 end
 
 function reset!(s::BGZFDecompressorStream)
@@ -238,12 +235,15 @@ function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::
             unsafe_copyto!(outptr, inptr, nb)
             consumed += nb
             codec.bufferlen += nb
-
-            # If we have read in data, but still not enough to queue a block, return no data
-            # and wait for more data to be passed
-            wait = iszero(consumed) & (codec.bufferlen < nfull(Block{T})) 
-            wait && return (consumed, 0, :ok)
         end
+
+        # If we have read in data, but still not enough to queue a block, return no data
+        # and wait for more data to be passed
+        wait = !iszero(consumed) & (codec.bufferlen < nfull(Block{T})) 
+        wait && return (consumed, 0, :ok)
+
+        # We check here if there is no data (because we can use data in the lock_block! ste)
+        nodata = eof & iszero(codec.bufferlen)
 
         # At this point, if there is any data in the buffer, it must be enough
         # to queue a whole block (since the buffer is either full, or input is EOF)
@@ -252,7 +252,6 @@ function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::
             queue!(block)
         end
 
-        nodata = eof & iszero(codec.bufferlen)
         blockindex = increment_block!(codec, nodata)
 
         # This happens if there is no block to go to to either load new data or return
