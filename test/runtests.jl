@@ -204,6 +204,7 @@ end
         @test data[coff+1:coff+2] == [0x1f, 0x8b]
         seekstart(stream)
         seek(stream, v)
+        @test VirtualOffset(stream) == v
         @test read(stream, 128) == next
     end
     

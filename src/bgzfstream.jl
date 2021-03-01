@@ -158,6 +158,10 @@ function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
     block_offset, byte_offset = offsets(v)
     _seek(s, block_offset)
 
+    # Set a "dummy offset" - when getting the virtual offset after seeking, we
+    # need to be able to obtain original block offset
+    s.codec.offsets[1] = (block_offset, 0)
+
     # Read one byte to fill in buffer
     read(s, UInt8)
 
