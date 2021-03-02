@@ -252,7 +252,11 @@ end
     @test collect(reinterpret(Int, bytes)) == reallen
 
     A = collect(reinterpret(UInt8, rand(1:2000, 100000)))
-    compressed = read(BGZFCompressorStream(Buffer(A)))
+    buffer = Buffer()
+    writer = BGZFCompressorStream(buffer)
+    write(writer, A)
+    close(writer)
+    compressed = take!(buffer)
     bytes = gzi(Buffer(compressed))
     buffer = IOBuffer(compressed)
     nums = reinterpret(Int, bytes)
@@ -262,7 +266,9 @@ end
     # Now seek every block offset. It will crash if its not a valid block
     for coffset in nums[2:2:end]
         seek(reader, VirtualOffset(coffset, 0))
+        @test VirtualOffset(reader) == VirtualOffset(coffset, 0)
     end
+    @test eof(reader)
 end
         
     

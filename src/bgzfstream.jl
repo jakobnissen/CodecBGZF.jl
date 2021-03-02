@@ -163,13 +163,14 @@ function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
     s.codec.offsets[1] = (block_offset, 0)
 
     # Read one byte to fill in buffer
-    read(s, UInt8)
+    is_eof = eof(s)
+    is_eof || read(s, UInt8)
 
     # Now advance buffer block_offset minus the one byte we just read
     if byte_offset > get_block(s.codec).outlen
         throw(ArgumentError("Too large offset for block"))
     end
-    s.state.buffer1.bufferpos += (byte_offset % Int - 1)
+    s.state.buffer1.bufferpos += (byte_offset % Int - !is_eof)
     return s
 end
 
@@ -185,7 +186,7 @@ function VirtualOffset(s::BGZFDecompressorStream)
     # This is a little tricky, because the output buffer may buffer an arbitrary
     # large amount of blocks, and we can't keep track of all these blocks'
     # offsets
-    n_buffered = s.state.buffer1.bufferpos - s.state.buffer1.markpos - 1
+    n_buffered = max(0, s.state.buffer1.bufferpos - s.state.buffer1.markpos - 1)
     blockindex = 1
 
     # Next we backtrace
