@@ -9,6 +9,7 @@ export
     gzi
 
 using LibDeflate
+import LibDeflate: GzipExtraField
 using TranscodingStreams
 
 import TranscodingStreams:
