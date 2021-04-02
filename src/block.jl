@@ -58,16 +58,16 @@ function check_eof_block(block::Block{Decompressor})
     end
 end
 
-"Get the BSIZE field from block by reading from indata vector"
-function bsize(block::Block{Decompressor})::Union{UInt16, Nothing}
+"Get the BSIZE field from block by reading from given vector"
+function bsize(block::Block{Decompressor}, vector::Vector{UInt8})::Union{UInt16, Nothing}
     fieldnum = findfirst(block.gzip_extra_fields) do field
         field.tag === (UInt8('B'), UInt8('C'))
     end
     fieldnum === nothing && return nothing
     field = @inbounds block.gzip_extra_fields[fieldnum]
     field.data === nothing && return nothing
-    length(field.data) != 4 && return nothing
-    return bitload(UInt16, self.indata, first(field.data))
+    length(field.data) != 2 && return nothing
+    return vector[first(field.data)] | (vector[last(field.data)] << 8)
 end
 
 "Process the block in another thread"
