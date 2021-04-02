@@ -15,11 +15,10 @@ mutable struct BGZFCodec{T <: DE_COMPRESSOR, O <: IO} <: TranscodingStreams.Code
     buffer::Vector{UInt8}
     blocks::Vector{Block{T}}
 
-    # This has the (offset, decompress_len) of UPCOMING block at pos 1
-    # then current block, then prev blocks. We use it to
-    # keep track of VirtualOffsets of blocks we may have shipped off to the output
-    # buffer long ago
-    offsets::Vector{Tuple{Int, Int}}
+    # This keeps the last virtualoffset of previous blocks that we have already
+    # shipped off to the stream's output buffer. We use this to backtrace and find
+    # the virtualoffset for the stream.
+    offsets::Vector{VirtualOffset}
 
     # We need this in order to write an EOF on end for the CompressorCodec
     io::O
@@ -33,6 +32,7 @@ const CompressorCodec{O} = BGZFCodec{Compressor, O} where {O <: IO}
 const DecompressorCodec{O} = BGZFCodec{Decompressor, O} where {O <: IO}
 const BGZFCompressorStream = TranscodingStream{CompressorCodec{O}, O} where {O <: IO}
 const BGZFDecompressorStream = TranscodingStream{DecompressorCodec{O}, O} where {O <: IO}
+const CACHED_VOFFSETS = 16
 
 """
     BGZFCompressorStream(io::IO; threads=nthreads(), compresslevel=6)
@@ -60,7 +60,7 @@ function CompressorCodec(io::IO, nthreads, compresslevel)
     nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
     buffer = Vector{UInt8}(undef, SAFE_BLOCK_SIZE)
     blocks = [Block(Compressor(compresslevel)) for i in 1:nthreads]
-    offsets = fill((0,0), 16)
+    offsets = fill(VirtualOffset(0,0), CACHED_VOFFSETS)
     return CompressorCodec{typeof(io)}(buffer, blocks, offsets, io, 1, 0, 1)
 end
 
@@ -68,7 +68,7 @@ function DecompressorCodec(io::IO, nthreads)
     nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
     buffer = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
     blocks = [Block(Decompressor()) for i in 1:nthreads]
-    offsets = fill((0,0), 16)
+    offsets = fill(VirtualOffset(0,0), CACHED_VOFFSETS)
     return DecompressorCodec{typeof(io)}(buffer, blocks, offsets, io, 1, 0, 1)
 end
 
@@ -103,7 +103,7 @@ function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::
         # At this point, if there is any data in the buffer, it must be enough
         # to queue a whole block (since the buffer is either full, or input is EOF)
         if !iszero(codec.bufferlen)
-            queue_block!(codec)
+            load_block!(codec)
         end
 
 
@@ -111,8 +111,6 @@ function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::
         # load more data in (if we have more data to load in)
         moredata = !(eof & iszero(codec.bufferlen))
         blockindex = next_block!(codec, moredata)
-
-        sleep(0.1) # TODO: REMOVE THIS
 
         # This happens if there is no block to go to to either load new data or return
         # existing data. Then we are done.
@@ -138,52 +136,36 @@ function copy_from_outbuffer(codec::BGZFCodec, output::Memory, consumed::Integer
     unsafe_copyto!(output.ptr, pointer(block.outdata, codec.blockindex), n)
     codec.blockindex += n
 
-    # We mark the block as empty if we have already output its data
-    codec.blockindex > block.outlen && empty!(block)
+    # If we have copied all data from a block, we mark it as empty
+    # and reset the blockindex
+    if codec.blockindex > block.outlen
+        empty!(block)
+        codec.blockindex = 1
+    end
     return (Int(consumed), n, :ok)
 end
 
 "Get number of remaning bytes in the codec's buffer before a new block can be indexed"
 remaining(codec::BGZFCodec{T}) where T = nfull(Block{T}) - codec.bufferlen
 
-"Load data from buffer into the current block, and queue its decompression"
-function queue_block!(codec::DecompressorCodec)
-    # Parse header
+function load_block!(codec::DecompressorCodec)
     buffer = codec.buffer
-    block = get_block(codec)
-    header_len, header = LibDeflate.parse_gzip_header(
-        buffer,
-        length(buffer) % UInt,
-        block.gzip_extra_fields
-    )
-
-    bsiz = bsize(block, buffer)
-    bsiz === nothing && error("No GZIP extra field \"BSIZE\"")
-    # By spec, BSIZE is block size -1. Include header_len bytes header, 8 byte tail
-    blocksize = bsiz + 1
-    block.inlen = blocksize - header_len - 8
-    block.crc32 = bitload(UInt32, buffer, blocksize - 7)
-    block.outlen = bitload(UInt32, buffer, blocksize - 3)
-    unsafe_copyto!(block.indata, 1, buffer, header_len + 1, block.inlen)
-    
-    # Shift data in buffer
-    unsafe_copyto!(buffer, 1, buffer, blocksize+1, length(buffer)-blocksize)
-    codec.bufferlen -= blocksize
-    queue!(block)
+    nbytes = load_block!(get_block(codec), buffer, codec.bufferlen)
+    unsafe_copyto!(buffer, 1, buffer, nbytes+1, codec.bufferlen-nbytes)
+    codec.bufferlen -= nbytes
+    return nothing
 end
 
 "Load data from buffer into the current block, and queue its decompression"
-function queue_block!(codec::CompressorCodec)
-    block.inlen = codec.bufferlen
-    unsafe_copyto!(block.indata, 1, codec.buffer, 1, codec.bufferlen)
+function load_block!(codec::CompressorCodec)
+    load_block!(get_block(codec), codec.buffer, UInt16(codec.bufferlen - 1))
     codec.bufferlen = 0
-    queue!(block)
+    return nothing
 end
 
 """Switches the code to the next block to process, given whether the input stream is eof.
 Returns block index, or nothing if there are no more blocks to process"""
 function next_block!(codec::BGZFCodec, moredata::Bool)
-    codec.blockindex = 1 # reset blockindex
     block = get_block(codec)
     nextblock = nothing
     nextindex = codec.index
@@ -195,7 +177,9 @@ function next_block!(codec::BGZFCodec, moredata::Bool)
         # If there is more data to get from that block, or we have more
         # data to load in, we can use that block
         if moredata || !isempty(nextblock)
-            #push_offsets!(codec) # TODO: ADD THIS IN
+            
+            # If the block contains data, we need to add that data to the offsets
+            # isempty(nextblock) || push_offsets!(codec) # TODO
             return (codec.index = nextindex)
         end
     end
@@ -205,11 +189,15 @@ function next_block!(codec::BGZFCodec, moredata::Bool)
     return nothing
 end
 
+######################### TODO: THIS MARKS THE END OF TESTED CODE.
+
 "Add the current block's offsets and lengths to the codex offset vector"
-function push_offsets!(codec)
-    unsafe_copyto!(codec.offsets, 2, codec.offsets, 1, 15)
+function push_offsets!(codec::BGZFCodec)
+    unsafe_copyto!(codec.offsets, 2, codec.offsets, 1, CACHED_VOFFSETS - 1)
     block = get_block(codec)
-    codec.offsets[1] = (block.offset, block.outlen)
+    oldcoffset, olduoffset = @inbounds codec.offsets[2]
+
+    codec.offsets[1] = (block.offset, block.outlen - 1)
 end
 
 "Get the offset for the soon-to-be indexed block based on the previous block"
@@ -315,8 +303,6 @@ end
 function TranscodingStreams.finalize(codec::CompressorCodec)
     write(codec.io, EOF_BLOCK)
 end
-
-
 
 # Read exactly N bytes to i'th index of data, except if stream is EOF
 function read_nbytes(io::TranscodingStream, data::Vector{UInt8}, i::Integer, N::Integer)

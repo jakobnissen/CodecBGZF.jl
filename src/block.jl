@@ -1,12 +1,12 @@
 # BGZF blocks
 # 
 # Code in this file should not "know about" Codecs, TranscodingStreams,
-# or any of that. It should only rely on LibDeflate, so that means the
-# code in this file can easily be cannibalized for other packages.
+# or any of that. It should only rely on Base and LibDeflate, so that means the
+# code in this file can easily be cannibalized for other packages, or repurposed.
 
 # We must write these bytes *exactly* per the BGZF spec,
 # we can't just write an empty block, as some of the fields
-# may not be these exact bytes.
+# (e.g. MTIME or OS) may not be these exact bytes.
 const EOF_BLOCK = [
     0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
     0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
@@ -18,7 +18,7 @@ const EOF_BLOCK = [
 const MAX_BLOCK_SIZE = UInt(64 * 1024)
 
 # Maximum number of bytes to be compressed at one time. Random bytes usually end up filling
-# a bit more when compressed, so we have a 256 byte margin of safety.
+# a bit more when compressed, so we have a generous 256 byte margin of safety.
 const SAFE_BLOCK_SIZE = UInt(MAX_BLOCK_SIZE - 256)
 
 # Field descriptions are for decompressors / compressors
@@ -29,8 +29,11 @@ mutable struct Block{T}
     task::Task
     gzip_extra_fields::Vector{LibDeflate.GzipExtraField} # cached to avoid allocating
     crc32::UInt32    # stated checksum / calculated checksum
-    outlen::UInt16   # Length of decompressed payload / compressed block
-    inlen::UInt16    # Length of compressed payload / total input block
+
+    # BGZF blocks can store 0:typemax(UInt16)+1 bytes
+    # so unfortunately UInt16 will not suffice here.
+    outlen::UInt32   # Length of decompressed payload / compressed block
+    inlen::UInt32    # Length of compressed payload / total input block
 end
 
 function Block(dc::T) where T <: DE_COMPRESSOR
@@ -53,6 +56,8 @@ nfull(::Type{Block{Compressor}}) = SAFE_BLOCK_SIZE
 Base.wait(b::Block) = wait(b.task)
 
 function check_eof_block(block::Block{Decompressor})
+    # We don't store the metadata, so can't compare to EOF_BLOCK. BGZF specs
+    # allows us to simply check for a zero-length block.
     if !iszero(block.outlen)
         bgzferror("No EOF block. Truncated file?")
     end
@@ -67,12 +72,45 @@ function bsize(block::Block{Decompressor}, vector::Vector{UInt8})::Union{UInt16,
     field = @inbounds block.gzip_extra_fields[fieldnum]
     field.data === nothing && return nothing
     length(field.data) != 2 && return nothing
-    return vector[first(field.data)] | (vector[last(field.data)] << 8)
+    return (vector[first(field.data)] % UInt16) | ((vector[last(field.data)] % UInt16) << 8)
+end
+
+"""Load data from buffer starting at index 1 into the block, and queue its decompression
+in another thread. Return number of bytes consumed"""
+function load_block!(block::Block{Decompressor}, buffer::Vector{UInt8}, len::Unsigned)
+    # Parse header
+    header_len, header = LibDeflate.parse_gzip_header(
+        buffer,
+        len % UInt,
+        block.gzip_extra_fields
+    )
+
+    bsiz = bsize(block, buffer)
+    bsiz === nothing && error("No GZIP extra field \"BSIZE\"")
+    # By spec, BSIZE is block size -1. Include header_len bytes header, 8 byte tail
+    blocksize = bsiz + 1
+    block.inlen = blocksize - header_len - 8
+    block.crc32 = bitload(UInt32, buffer, blocksize - 7)
+    block.outlen = bitload(UInt32, buffer, blocksize - 3)
+    unsafe_copyto!(block.indata, 1, buffer, header_len + 1, block.inlen)
+    queue!(block)
+    return blocksize
+end
+
+"Load `len_minus_one+1` bytes from `buffer` into the block and queue its compression in another thread."
+function load_block!(block::Block{Compressor}, buffer::Vector{UInt8}, len_minus_one::UInt16)
+    block.inlen = len + 1
+    # We zero the outlen to mark that it has no data _until_ the queue happens,
+    # where the correct outlen is set
+    block.outlen = 0
+    unsafe_copyto!(block.indata, 1, buffer, 1, len + 1)
+    queue!(block)
+    return nothing
 end
 
 "Process the block in another thread"
 queue!(block::Block) = block.task = @spawn _queue!(block)
-
+ 
 function _queue!(block::Block{Decompressor})
     unsafe_decompress!(Base.HasLength(), block.de_compressor,
                        pointer(block.outdata), block.outlen,
