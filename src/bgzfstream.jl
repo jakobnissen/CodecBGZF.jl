@@ -23,7 +23,7 @@ mutable struct BGZFCodec{T <: DE_COMPRESSOR, O <: IO} <: TranscodingStreams.Code
     # We need this in order to write an EOF on end for the CompressorCodec
     io::O
 
-    index::UInt      # Index of the currently used block in "blocks"
+    index::UInt        # Index of the currently used block in "blocks"
     bufferlen::UInt32  # Number of filled bytes of the buffer
     blockindex::UInt32 # Index of buffer within the currently used block 
 end
@@ -59,7 +59,7 @@ end
 function CompressorCodec(io::IO, nthreads, compresslevel)
     nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
     buffer = Vector{UInt8}(undef, SAFE_BLOCK_SIZE)
-    blocks = [Block(Compressor(compresslevel)) for i in 1:nthreads]
+    blocks = [Block(Compressor(compresslevel)) for _ in 1:nthreads]
     offsets = fill(VirtualOffset(0,0), CACHED_VOFFSETS)
     return CompressorCodec{typeof(io)}(buffer, blocks, offsets, io, 1, 0, 1)
 end
@@ -67,7 +67,7 @@ end
 function DecompressorCodec(io::IO, nthreads)
     nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
     buffer = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
-    blocks = [Block(Decompressor()) for i in 1:nthreads]
+    blocks = [Block(Decompressor()) for _ in 1:nthreads]
     offsets = fill(VirtualOffset(0,0), CACHED_VOFFSETS)
     return DecompressorCodec{typeof(io)}(buffer, blocks, offsets, io, 1, 0, 1)
 end
@@ -75,7 +75,12 @@ end
 # Note: This function MUST make progress in either input or output, else
 # transcoding streams will keep resizing the buffers thinking the small buffer
 # size blocks the codec.
-function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::Memory, error::Error) where T
+function TranscodingStreams.process(
+    codec::BGZFCodec{T},
+    input::TranscodingStreams.Memory,
+    output::TranscodingStreams.Memory,
+    ::TranscodingStreams.Error
+) where T
     consumed = 0
     eof = iszero(length(input))
     
@@ -106,7 +111,6 @@ function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::
             load_block!(codec)
         end
 
-
         # Move to next block where there is either data to return, or space to
         # load more data in (if we have more data to load in)
         moredata = !(eof & iszero(codec.bufferlen))
@@ -120,7 +124,7 @@ end
 
 nblocks(c::BGZFCodec) = length(c.blocks)
 get_block(c::BGZFCodec) = @inbounds c.blocks[c.index]
-last_block(c::BGZFCodec) = @inbounds c.blocks[ifelse(c.index == 1, nblocks(c), c.index-1)]
+previous_block(c::BGZFCodec) = @inbounds c.blocks[ifelse(c.index == 1, nblocks(c), c.index-1)]
 
 "Check if the currently active block has no more output bytes"
 function is_current_block_empty(c::BGZFCodec)
@@ -129,7 +133,7 @@ function is_current_block_empty(c::BGZFCodec)
 end
 
 "Return data already prepared in the current block"
-function copy_from_outbuffer(codec::BGZFCodec, output::Memory, consumed::Integer)
+function copy_from_outbuffer(codec::BGZFCodec, output::TranscodingStreams.Memory, consumed::Integer)
     block = get_block(codec)
     available = block.outlen - codec.blockindex + 1
     n = min(available, length(output))
@@ -202,13 +206,13 @@ end
 
 "Get the offset for the soon-to-be indexed block based on the previous block"
 function get_new_offset(codec::DecompressorCodec)
-    lastblock = last_block(codec)
+    lastblock = previous_block(codec)
     return lastblock.offset + lastblock.blocklen
 end
 
 "Get the offset for the soon-to-be indexed block based on the previous block"
 function get_new_offset(codec::CompressorCodec)
-    lastblock = last_block(codec)
+    lastblock = previous_block(codec)
     return lastblock.offset + lastblock.inlen
 end
 
@@ -355,8 +359,10 @@ function gzi(io::TranscodingStream)
     end
 
     result = Vector{UInt8}(undef, 16 * length(gzi) + 8)
-    bitstore(length(gzi) % UInt64, result, 1)
-    unsafe_copyto!(pointer(result, 9), Ptr{UInt8}(pointer(gzi)), length(result)-8)
+    GC.@preserve result begin
+        bitstore!(length(gzi) % UInt64, result, 1)
+        unsafe_copyto!(pointer(result, 9), Ptr{UInt8}(pointer(gzi)), length(result)-8)
+    end
     return result
 end
 

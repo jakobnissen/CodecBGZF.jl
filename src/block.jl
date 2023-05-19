@@ -1,18 +1,54 @@
-# BGZF blocks
-# 
-# Code in this file should not "know about" Codecs, TranscodingStreams,
-# or any of that. It should only rely on Base and LibDeflate, so that means the
-# code in this file can easily be cannibalized for other packages, or repurposed.
+"""
+    BGZF blocks
+ 
+Code in this file should not "know about" Codecs, TranscodingStreams,
+or any of that. It should only rely on Base and LibDeflate, so that means the
+code in this file can easily be cannibalized for other packages, or repurposed.
+"""
+module Blocks
 
-# We must write these bytes *exactly* per the BGZF spec,
-# we can't just write an empty block, as some of the fields
-# (e.g. MTIME or OS) may not be these exact bytes.
-const EOF_BLOCK = [
-    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
-    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00
+import ..bitstore!, ..bitload, ..DE_COMPRESSOR, ..bgzferror
+
+using Base.Threads: @spawn
+
+using LibDeflate:
+    ReadableMemory,
+    LibDeflateError,
+    Compressor,
+    Decompressor,
+    parse_gzip_header,
+    GzipExtraField,
+    unsafe_decompress!,
+    unsafe_compress!,
+    unsafe_crc32
+
+export Block,
+    bsize,
+    load_block!
+
+# Every BGZF block begins with exactly these bytes.
+# Note that we MUST e.g. ignore mtime and OS to be completely BGZF compliant
+const BLOCK_HEADER = [
+    0x1f, 0x8b, # Magic bytes
+    0x08, # Compression method is DEFLATE
+    0x04, # Flags: Contains extra fields
+    0x00, 0x00, 0x00, 0x00, # Modification time (mtime): Zero'd out
+    0x00, # Extra flags: None used
+    0xff, # Operating system: Unknown (we don't care about OS)
+    0x06, 0x00, # 6 bytes of extra data to follow
+    0x42, 0x43, # Xtra info tag: "BC"
+    0x02, 0x00 # 2 bytes of data for tag "BC",
 ]
+
+const EOF_BLOCK = vcat(
+    BLOCK_HEADER,
+    [
+        0x1b, 0x00, # Total size of block - 1
+        0x03, 0x00, # DEFLATE compressed load of the empty input
+        0x00, 0x00, 0x00, 0x00, # CRC32 of the empty input
+        0x00, 0x00, 0x00, 0x00  # Input size of the empty input 
+    ]
+)
 
 # BGZF blocks are no larger than 64 KiB before and after compression.
 const MAX_BLOCK_SIZE = UInt(64 * 1024)
@@ -27,7 +63,7 @@ mutable struct Block{T}
     outdata::Vector{UInt8}
     indata::Vector{UInt8}
     task::Task
-    gzip_extra_fields::Vector{LibDeflate.GzipExtraField} # cached to avoid allocating
+    gzip_extra_fields::Vector{GzipExtraField} # cached to avoid allocating
     crc32::UInt32    # stated checksum / calculated checksum
 
     # BGZF blocks can store 0:typemax(UInt16)+1 bytes
@@ -42,12 +78,13 @@ function Block(dc::T) where T <: DE_COMPRESSOR
 
     # We initialize with a trivial, but completable task for sake of simplicity
     task = schedule(Task(() -> nothing))
-    return Block{T}(dc, outdata, indata, task, LibDeflate.GzipExtraField[], 0, 0, 0)
+    return Block{T}(dc, outdata, indata, task, GzipExtraField[], 0, 0, 0)
 end
 
 function Base.empty!(block::Block)
     block.outlen = 0
     block.inlen = 0
+    block
 end
 Base.isempty(block::Block) = iszero(block.outlen)
 
@@ -78,32 +115,33 @@ end
 """Load data from buffer starting at index 1 into the block, and queue its decompression
 in another thread. Return number of bytes consumed"""
 function load_block!(block::Block{Decompressor}, buffer::Vector{UInt8}, len::Unsigned)
-    # Parse header
-    header_len, header = LibDeflate.parse_gzip_header(
-        buffer,
-        len % UInt,
-        block.gzip_extra_fields
-    )
-
-    bsiz = bsize(block, buffer)
-    bsiz === nothing && error("No GZIP extra field \"BSIZE\"")
-    # By spec, BSIZE is block size -1. Include header_len bytes header, 8 byte tail
-    blocksize = bsiz + 1
-    block.inlen = blocksize - header_len - 8
-    block.crc32 = bitload(UInt32, buffer, blocksize - 7)
-    block.outlen = bitload(UInt32, buffer, blocksize - 3)
-    unsafe_copyto!(block.indata, 1, buffer, header_len + 1, block.inlen)
+    GC.@preserve buffer begin
+        parsed_header = parse_gzip_header(
+            ReadableMemory(pointer(buffer), len); extra_data=block.gzip_extra_fields
+        )
+        parsed_header isa LibDeflateError && bgzferror("Block does not contain a gzip header")
+        header_len, _ = parsed_header
+        bsiz = bsize(block, buffer)
+        bsiz === nothing && bgzferror("No GZIP extra field \"BSIZE\"")
+        # By spec, BSIZE is block size -1. Include header_len bytes header, 8 byte tail
+        blocksize = bsiz + 1
+        block.inlen = blocksize - header_len - 8
+        block.crc32 = bitload(UInt32, buffer, blocksize - 7)
+        block.outlen = bitload(UInt32, buffer, blocksize - 3)
+        unsafe_copyto!(block.indata, 1, buffer, header_len + 1, block.inlen)
+    end
     queue!(block)
     return blocksize
 end
 
 "Load `len_minus_one+1` bytes from `buffer` into the block and queue its compression in another thread."
-function load_block!(block::Block{Compressor}, buffer::Vector{UInt8}, len_minus_one::UInt16)
-    block.inlen = len + 1
+function load_block!(block::Block{Compressor}, buffer::Vector{UInt8}, len::Unsigned)
+    to_compress = min(len, SAFE_BLOCK_SIZE)
+    block.inlen = to_compress
     # We zero the outlen to mark that it has no data _until_ the queue happens,
     # where the correct outlen is set
     block.outlen = 0
-    unsafe_copyto!(block.indata, 1, buffer, 1, len + 1)
+    unsafe_copyto!(block.indata, 1, buffer, 1, to_compress)
     queue!(block)
     return nothing
 end
@@ -112,29 +150,42 @@ end
 queue!(block::Block) = block.task = @spawn _queue!(block)
  
 function _queue!(block::Block{Decompressor})
-    unsafe_decompress!(Base.HasLength(), block.de_compressor,
-                       pointer(block.outdata), block.outlen,
-                       pointer(block.indata), block.inlen)
+    (indata, outdata) = (block.indata, block.outdata)
+    GC.@preserve indata outdata begin
+        unsafe_decompress!(
+            Base.HasLength(),
+            block.de_compressor,
+            pointer(outdata), block.outlen,
+            pointer(indata), block.inlen
+        )
 
-    crc32 = unsafe_crc32(pointer(block.outdata), block.outlen)
+        crc32 = unsafe_crc32(pointer(outdata), block.outlen)
+    end
     crc32 != block.crc32 && bgzferror("CRC32 checksum does not match")
     return nothing
 end
 
 function _queue!(block::Block{Compressor})
-    # Meat: The compressed data
-    compress_len = unsafe_compress!(block.de_compressor,
-                   pointer(block.outdata, 19), MAX_BLOCK_SIZE - 26,
-                   pointer(block.indata), block.inlen)
-    block.crc32 = unsafe_crc32(pointer(block.indata), block.inlen)
-    block.outlen = compress_len + 26
+    (indata, outdata) = (block.indata, block.outdata)
+    GC.@preserve indata outdata begin
+        # Meat: The compressed data
+        compress_len = unsafe_compress!(
+            block.de_compressor,
+            pointer(outdata, 19), MAX_BLOCK_SIZE - 26,
+            pointer(indata), block.inlen
+        )
+        block.crc32 = unsafe_crc32(pointer(block.indata), block.inlen)
+        block.outlen = compress_len + 26
 
-    # Header: 18 bytes of header
-    unsafe_copyto!(block.outdata, 1, BLOCK_HEADER, 1, 16)
-    bitstore(UInt16(block.outlen - 1), block.outdata, 17)
+        # Header: 18 bytes of header
+        unsafe_copyto!(outdata, 1, BLOCK_HEADER, 1, 16)
+        bitstore!(UInt16(block.outlen - 1), outdata, 17)
 
-    # Tail: CRC + isize
-    bitstore(block.crc32, block.outdata, 18 + compress_len + 1)
-    bitstore(block.inlen % UInt32, block.outdata, 18 + compress_len + 5)
+        # Tail: CRC + isize
+        bitstore!(block.crc32, outdata, 18 + compress_len + 1)
+        bitstore!(block.inlen % UInt32, outdata, 18 + compress_len + 5)
+    end
     return nothing
 end
+
+end # module

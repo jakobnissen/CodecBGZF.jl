@@ -8,17 +8,22 @@ export
     offsets,
     gzi
 
-using LibDeflate
-import LibDeflate: GzipExtraField
-using TranscodingStreams
+using LibDeflate:
+    ReadableMemory,
+    LibDeflateError,
+    Compressor,
+    Decompressor,
+    parse_gzip_header,
+    GzipExtraField,
+    unsafe_decompress!,
+    unsafe_compress!,
+    unsafe_crc32
 
-import TranscodingStreams:
+using TranscodingStreams:
     TranscodingStreams,
-    TranscodingStream,
-    Memory,
-    Error
+    TranscodingStream
 
-import Base.Threads.@spawn
+using Base.Threads: @spawn
 
 const DE_COMPRESSOR = Union{Compressor, Decompressor}
 
@@ -31,11 +36,13 @@ struct BGZFError <: Exception
     message::String
 end
 
-function bitload(T::Type{<:Base.BitInteger}, data::Vector{UInt8}, p::Integer)
+const BitInteger = Union{UInt8, UInt16, UInt32, UInt64, Int8, Int16, Int32, Int64}
+
+function bitload(T::Type{<:BitInteger}, data::Vector{UInt8}, p::Integer)
     ltoh(unsafe_load(Ptr{T}(pointer(data, p))))
 end
 
-function bitstore(v::Base.BitInteger, data::Vector{UInt8}, p::Integer)
+function bitstore!(v::BitInteger, data::Vector{UInt8}, p::Integer)
     unsafe_store!(Ptr{typeof(v)}(pointer(data, p)), htol(v))
 end
     
@@ -43,6 +50,9 @@ end
 
 include("virtualoffset.jl")
 include("block.jl")
+
+using .Blocks
+
 include("bgzfstream.jl")
 
 end # module
