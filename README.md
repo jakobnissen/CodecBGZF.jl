@@ -1,7 +1,6 @@
 # CodecBGZF.jl
 
-![CI](https://github.com/jakobnissen/CodecBGZF.jl/workflows/CI/badge.svg)
-[![codecov](https://codecov.io/gh/jakobnissen/CodecBGZF.jl/branch/master/graph/badge.svg?token=VKFC19YZUG)](https://codecov.io/gh/jakobnissen/CodecBGZF.jl)
+## This package is **DEPRECATED** in favor of BGZFLib.jl
 
 _Codec for BGZF files_
 
