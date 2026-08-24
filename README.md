@@ -1,4 +1,8 @@
-# CodecBGZF.jl
+# CodecBGZF.jl - DEPRECATED
+
+> [!CAUTION]
+> This package is DEPRECATED in favor of [BGZFLib.jl](https://github.com/BioJulia/BGZFLib.jl).
+> All users of this package is recommended to switch to BGZFLib, if possible.
 
 ![CI](https://github.com/jakobnissen/CodecBGZF.jl/workflows/CI/badge.svg)
 [![codecov](https://codecov.io/gh/jakobnissen/CodecBGZF.jl/branch/master/graph/badge.svg?token=VKFC19YZUG)](https://codecov.io/gh/jakobnissen/CodecBGZF.jl)

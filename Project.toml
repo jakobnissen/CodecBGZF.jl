@@ -1,7 +1,7 @@
 name = "CodecBGZF"
 uuid = "d9d91ef6-315d-495b-8131-db2ca24339d6"
 authors = ["Jakob Nybo Nissen <jakobnybonissen@gmail.com>"]
-version = "0.1.1"
+version = "0.1.2"
 
 [deps]
 LibDeflate = "9255714d-24a7-4b30-8ea3-d46a97f7e13b"
